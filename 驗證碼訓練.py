@@ -504,14 +504,14 @@ def main():
         'image_height': 69,                                                             # 輸入圖片高度
         'batch_size': 32,                                                               # 批次大小
         'num_epochs': 800,                                                              # 增加最大訓練週期
-        'learning_rate': 0.0005,                                                        # 降低學習率
+        'learning_rate': 0.002,                                                         # 降低學習率
         'weight_decay': 0.01,                                                           # 權重衰減
         'captcha_length': 6,                                                            # CAPTCHA 字元長度
         'use_mixup': True,                                                              # 是否使用 Mixup 資料增強
         'use_focalloss': True,                                                          # 是否使用 Focal Loss
         'gamma': 2.5,                                                                   # 提高 Focal Loss 的 gamma 參數
         'use_augmentation': True,                                                       # 是否使用額外資料增強
-        'early_stopping_patience': 80,                                                  # 增加提前停止的耐心值
+        'early_stopping_patience': 20,                                                  # 增加提前停止的耐心值
         'checkpoint_interval': 10,                                                      # 定期儲存檢查點的間隔
         'dropout_rate': 0.4,                                                            # 增加 dropout 率
         'label_smoothing': 0.1,                                                         # 新增標籤平滑
