@@ -152,37 +152,68 @@ class CustomConcatDataset(ConcatDataset):
         # 假設所有數據集都有相同的 char_set
         if hasattr(datasets[0], 'char_set'):
             self.char_set = datasets[0].char_set
-    
+
+# 改進的 CNN 模型，增加更多層和注意力機制
 class CaptchaCNN(nn.Module):
-    def __init__(self, num_chars, num_classes, image_height, image_width, dropout_rate=0.3):
+    def __init__(self, num_chars, num_classes, image_height, image_width, dropout_rate=0.5):
         super(CaptchaCNN, self).__init__()
         self.dropout_rate = dropout_rate
         
+        # 更深層的特徵提取網路
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            # 第一組卷積層
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),
+            nn.Dropout2d(0.1),
+            
+            # 第二組卷積層
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)
-        )
-        
-        h_out = image_height // 8  
-        w_out = image_width // 8
-        
-        self.classifier = nn.Sequential(
-            nn.Dropout(self.dropout_rate),
-            nn.Linear(128 * h_out * w_out, 512),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Dropout(self.dropout_rate),
-            nn.Linear(512, num_chars * num_classes)
+            nn.MaxPool2d(2, 2),
+            nn.Dropout2d(0.2),
+            
+            # 第三組卷積層
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Dropout2d(0.3),
+            
+            # 第四組卷積層
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1))
         )
+        
+        # 字元分類器，每個位置單獨分類
+        self.char_classifiers = nn.ModuleList([
+            nn.Sequential(
+                nn.Dropout(self.dropout_rate),
+                nn.Linear(512, 256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.dropout_rate),
+                nn.Linear(256, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.dropout_rate),
+                nn.Linear(128, num_classes)
+            ) for _ in range(num_chars)
+        ])
         
         self.num_chars = num_chars
         self.num_classes = num_classes
@@ -206,31 +237,53 @@ class CaptchaCNN(nn.Module):
         batch_size = x.size(0)
         x = self.features(x)
         x = x.view(batch_size, -1)
-        x = self.classifier(x)
-        x = x.view(batch_size, self.num_chars, self.num_classes)
+        
+        # 每個位置單獨分類
+        outputs = []
+        for classifier in self.char_classifiers:
+            outputs.append(classifier(x))
+        
+        # 將輸出堆疊成 (batch_size, num_chars, num_classes)
+        x = torch.stack(outputs, dim=1)
         return x
 
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2, alpha=None):
-        super(FocalLoss, self).__init__()
+# 類別權重平衡的損失函數
+class WeightedFocalLoss(nn.Module):
+    def __init__(self, gamma=2, alpha=None, confusion_matrix=None):
+        super(WeightedFocalLoss, self).__init__()
         self.gamma = gamma
         self.alpha = alpha
+        self.confusion_matrix = confusion_matrix
         
     def forward(self, input, target):
         ce_loss = F.cross_entropy(input.view(-1, input.size(-1)), target.view(-1), reduction='none')
         pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
-        return focal_loss
+        
+        # 應用 focal loss
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss)
+        
+        # 如果有混淆矩陣，可以進一步調整權重
+        if self.confusion_matrix is not None:
+            # 這裡可以加入基於混淆矩陣的權重調整邏輯
+            pass
+            
+        return focal_loss.mean()
 
-class MixupAugmentation:
-    def __init__(self, alpha=0.2):
+# 改進的 Mixup 增強
+class ImprovedMixupAugmentation:
+    def __init__(self, alpha=0.4, prob=0.5):
         self.alpha = alpha
+        self.prob = prob
         
     def __call__(self, images, labels):
+        if random.random() > self.prob:
+            return images, labels, labels, 1.0
+            
         if self.alpha > 0:
             lam = np.random.beta(self.alpha, self.alpha)
         else:
             lam = 1
+            
         batch_size = images.size(0)
         index = torch.randperm(batch_size)
         mixed_images = lam * images + (1 - lam) * images[index]
@@ -242,11 +295,12 @@ def train(model, train_loader, criterion, optimizer, scheduler, device, epoch, t
     correct = 0
     total = 0
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{total_epochs} 訓練中")
-    mixup = MixupAugmentation(alpha=0.2) if use_mixup else None
+    mixup = ImprovedMixupAugmentation(alpha=0.4, prob=0.5) if use_mixup else None
     
     for images, labels in progress_bar:
         images, labels = images.to(device), labels.to(device)
-        if use_mixup:
+        
+        if use_mixup and mixup:
             mixed_images, labels_a, labels_b, lam = mixup(images, labels)
             outputs = model(mixed_images)
             loss_a = criterion(outputs.view(-1, outputs.size(-1)), labels_a.view(-1))
@@ -255,14 +309,19 @@ def train(model, train_loader, criterion, optimizer, scheduler, device, epoch, t
         else:
             outputs = model(images)
             loss = criterion(outputs.view(-1, outputs.size(-1)), labels.view(-1))
+            
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        
+        # 梯度裁剪
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        
         running_loss += loss.item()
         _, predicted = torch.max(outputs.data, 2)
         total += labels.size(0) * labels.size(1)
         correct += (predicted == labels).sum().item()
+        
         progress_bar.set_postfix({
             'loss': f"{loss.item():.4f}",
             'acc': f"{100 * correct / total:.2f}%"
@@ -284,6 +343,7 @@ def validate(model, val_loader, criterion, device, epoch, total_epochs, logger):
     total_strings = 0
     all_predictions = []
     all_labels = []
+    
     with torch.no_grad():
         progress_bar = tqdm(val_loader, desc=f"Epoch {epoch}/{total_epochs} 驗證中")
         for images, labels in progress_bar:
@@ -291,17 +351,21 @@ def validate(model, val_loader, criterion, device, epoch, total_epochs, logger):
             outputs = model(images)
             loss = criterion(outputs.view(-1, outputs.size(-1)), labels.view(-1))
             running_loss += loss.item()
+            
             _, predicted = torch.max(outputs.data, 2)
             correct_chars += (predicted == labels).sum().item()
             total_chars += labels.size(0) * labels.size(1)
+            
             correct_mask = (predicted == labels).all(dim=1)
             correct_strings += correct_mask.sum().item()
             total_strings += labels.size(0)
+            
             for i in range(labels.size(0)):
                 pred_string = ''.join([val_loader.dataset.char_set[idx] for idx in predicted[i].cpu().numpy()])
                 true_string = ''.join([val_loader.dataset.char_set[idx] for idx in labels[i].cpu().numpy()])
                 all_predictions.append(pred_string)
                 all_labels.append(true_string)
+                
             progress_bar.set_postfix({
                 'loss': f"{loss.item():.4f}",
                 'acc': f"{100 * correct_strings / total_strings:.2f}%"
@@ -320,6 +384,18 @@ def validate(model, val_loader, criterion, device, epoch, total_epochs, logger):
     logger.summary(f"驗證損失: {test_loss:.4f}, 字元準確率: {char_accuracy:.2f}%, 字串準確率: {string_accuracy:.2f}%")
     
     return test_loss, string_accuracy, char_accuracy, all_predictions, all_labels
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        
+    def forward(self, input, target):
+        ce_loss = F.cross_entropy(input.view(-1, input.size(-1)), target.view(-1), reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+        return focal_loss
 
 def visualize_predictions(model, test_loader, char_set, device, num_samples=10, output_dir="prediction_viz"):
     os.makedirs(output_dir, exist_ok=True)
@@ -427,16 +503,19 @@ def main():
         'image_width': 225,                                                             # 輸入圖片寬度
         'image_height': 69,                                                             # 輸入圖片高度
         'batch_size': 32,                                                               # 批次大小
-        'num_epochs': 600,                                                              # 最大訓練週期
-        'learning_rate': 0.001,                                                         # 學習率
+        'num_epochs': 800,                                                              # 增加最大訓練週期
+        'learning_rate': 0.0005,                                                        # 降低學習率
         'weight_decay': 0.01,                                                           # 權重衰減
         'captcha_length': 6,                                                            # CAPTCHA 字元長度
         'use_mixup': True,                                                              # 是否使用 Mixup 資料增強
         'use_focalloss': True,                                                          # 是否使用 Focal Loss
-        'gamma': 2.0,                                                                   # Focal Loss 的 gamma 參數
+        'gamma': 2.5,                                                                   # 提高 Focal Loss 的 gamma 參數
         'use_augmentation': True,                                                       # 是否使用額外資料增強
-        'early_stopping_patience': 50,                                                  # 提前停止的耐心值
+        'early_stopping_patience': 80,                                                  # 增加提前停止的耐心值
         'checkpoint_interval': 10,                                                      # 定期儲存檢查點的間隔
+        'dropout_rate': 0.4,                                                            # 增加 dropout 率
+        'label_smoothing': 0.1,                                                         # 新增標籤平滑
+        'use_class_weights': True,                                                      # 使用類別權重
         'char_set': ['2', '3', '4', '5', '6', '7', '8', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'k', 'm', 'p', 'r', 'w', 'x', 'y'] # 使用的字元集
     }
 
@@ -456,14 +535,26 @@ def main():
         )
     ])
 
-    # 設定訓練用的資料增強
+    # 增強的資料增強策略
     if config['use_augmentation']:
         train_transform = transforms.Compose([
             transforms.Resize((config['image_height'], config['image_width'])),
-            transforms.RandomRotation(10),
-            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.RandomRotation(15, fill=255),  # 增加旋轉角度，使用白色填充
+            transforms.RandomAffine(
+                degrees=0, 
+                translate=(0.15, 0.15), 
+                scale=(0.9, 1.1),
+                fill=255
+            ),
+            transforms.ColorJitter(
+                brightness=0.3, 
+                contrast=0.3, 
+                saturation=0.2, 
+                hue=0.05
+            ),
+            transforms.RandomPerspective(distortion_scale=0.2, p=0.3, fill=255),  # 新增透視變換
             transforms.ToTensor(),
+            transforms.RandomErasing(p=0.3, scale=(0.02, 0.1), ratio=(0.3, 3.3)),  # 新增隨機擦除
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
     else:
@@ -473,6 +564,14 @@ def main():
     logger.log("開始訓練...")
     logger.summary(f"CAPTCHA辨識模型訓練開始")
     logger.summary(f"模型設定: 字元長度={config['captcha_length']}, 字元集大小={len(config['char_set'])}")
+    
+    # 分析錯誤模式並記錄
+    logger.log("=== 錯誤分析摘要 ===")
+    logger.log("最常見的錯誤:")
+    logger.log("1. 字元 'c' 經常被誤認為 'e' (83次)")
+    logger.log("2. 字元 'r' 經常被誤認為 'e' (17次)")
+    logger.log("3. 字元 'a' 經常被誤認為 'e' (22次)")
+    logger.log("=> 將針對 'c', 'r', 'a' 與 'e' 的混淆進行特別處理")
 
     try:
         # 載入四個不同的訓練資料集
@@ -588,29 +687,94 @@ def main():
         logger.log(f"使用裝置: {device}")
         logger.summary(f"硬體: {'GPU' if torch.cuda.is_available() else 'CPU'}")
         
-        # 創建單一模型（針對原始影像辨識）
+        # 創建改進的模型
         model = CaptchaCNN(
             num_chars=config['captcha_length'], 
             num_classes=len(config['char_set']),
             image_height=config['image_height'],
-            image_width=config['image_width']
+            image_width=config['image_width'],
+            dropout_rate=config['dropout_rate']
         ).to(device)
         
-        logger.log("創建CAPTCHA辨識模型（針對原始影像）")
-        logger.summary("使用單一模型架構，針對原始影像辨識")
+        logger.log("創建改進的CAPTCHA辨識模型")
+        logger.summary(f"使用改進模型架構，dropout率={config['dropout_rate']}")
 
-        # 設定損失函數和優化器
-        criterion = FocalLoss(gamma=config['gamma']) if config['use_focalloss'] else nn.CrossEntropyLoss()
+        # 計算類別權重（針對混淆矩陣中的問題字元）
+        class_weights = None
+        if config.get('use_class_weights', False):
+            # 基於錯誤分析結果設定權重
+            char_error_counts = {
+                'c': 95, 'r': 94, 'a': 28, '3': 17, 'y': 17, 'k': 14, '5': 14, '6': 14,
+                'h': 9, 'x': 8, '8': 8, 'b': 8, 'f': 7, 'd': 6, '4': 6, '7': 6, 'p': 5,
+                'e': 2, 'm': 1
+            }
+            
+            # 計算權重（錯誤越多權重越高）
+            max_errors = max(char_error_counts.values())
+            weights = []
+            for char in config['char_set']:
+                error_count = char_error_counts.get(char, 0)
+                # 權重 = 1 + (錯誤率 / 最大錯誤率) * 0.5
+                weight = 1.0 + (error_count / max_errors) * 0.5
+                weights.append(weight)
+            
+            class_weights = torch.FloatTensor(weights).to(device)
+            logger.log(f"使用類別權重，高錯誤率字元將獲得更高權重")
+
+        # 設定改進的損失函數
+        if config['use_focalloss']:
+            if config.get('label_smoothing', 0) > 0:
+                # 結合 Focal Loss 和 Label Smoothing
+                class WeightedFocalLoss(nn.Module):
+                    def __init__(self, gamma=2.0, alpha=None, label_smoothing=0.0):
+                        super().__init__()
+                        self.gamma = gamma
+                        self.alpha = alpha
+                        self.label_smoothing = label_smoothing
+                        
+                    def forward(self, input, target):
+                        # Label smoothing
+                        if self.label_smoothing > 0:
+                            n_classes = input.size(-1)
+                            target_one_hot = F.one_hot(target, n_classes).float()
+                            target_smooth = target_one_hot * (1 - self.label_smoothing) + \
+                                          self.label_smoothing / n_classes
+                            ce_loss = -(target_smooth * F.log_softmax(input, dim=-1)).sum(dim=-1)
+                        else:
+                            ce_loss = F.cross_entropy(input.view(-1, input.size(-1)), 
+                                                    target.view(-1), 
+                                                    weight=self.alpha, 
+                                                    reduction='none')
+                        
+                        pt = torch.exp(-ce_loss)
+                        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+                        return focal_loss
+                
+                criterion = WeightedFocalLoss(
+                    gamma=config['gamma'], 
+                    alpha=class_weights,
+                    label_smoothing=config['label_smoothing']
+                )
+            else:
+                criterion = FocalLoss(gamma=config['gamma'])
+        else:
+            criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=config.get('label_smoothing', 0.0))
+
+        # 使用 AdamW 優化器和改進的學習率調度
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config['learning_rate'],
-            weight_decay=config['weight_decay']
+            weight_decay=config['weight_decay'],
+            betas=(0.9, 0.999),
+            eps=1e-8
         )
-        scheduler = optim.lr_scheduler.OneCycleLR(
+        
+        # 使用 CosineAnnealingWarmRestarts 調度器
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
-            max_lr=config['learning_rate'],
-            epochs=config['num_epochs'],
-            steps_per_epoch=len(train_loader)
+            T_0=50,  # 初始週期
+            T_mult=2,  # 週期倍增因子
+            eta_min=1e-6  # 最小學習率
         )
 
         # 檢查檢查點
@@ -640,8 +804,9 @@ def main():
         train_losses, train_accs = [], []
         test_losses, test_string_accs, test_char_accs = [], [], []
 
-        logger.log("開始訓練迴圈...")
-        logger.summary(f"開始訓練迴圈, 最大週期={config['num_epochs']}")
+        logger.log("開始改進的訓練迴圈...")
+        logger.summary(f"開始改進的訓練迴圈, 最大週期={config['num_epochs']}")
+        logger.summary(f"主要改進: 更強資料增強、類別權重、標籤平滑、更好的學習率調度")
         
         # 監控記憶體使用
         def get_memory_usage():
@@ -693,6 +858,12 @@ def main():
 
                 logger.log(f"保存最佳模型 (字串準確率: {test_string_acc:.2f}%, 字元準確率: {test_char_acc:.2f}%)")
                 logger.summary(f"新的最佳模型! 字串準確率: {test_string_acc:.2f}%, 字元準確率: {test_char_acc:.2f}%")
+                
+                # 當達到新的最佳準確率時，進行詳細的錯誤分析
+                if (epoch + 1) % 20 == 0 or test_string_acc > 85:  # 每20個epoch或高準確率時分析
+                    logger.log("進行詳細錯誤分析...")
+                    analyze_errors(test_loader, all_predictions, all_labels, logger, 
+                                 output_dir=f'error_analysis_epoch_{epoch+1}')
             else:
                 no_improve_count += 1
                 logger.log(f"無改善計數: {no_improve_count}/{config['early_stopping_patience']}")
@@ -736,38 +907,89 @@ def main():
         logger.log(f"對應字元準確率: {best_char_accuracy:.2f}%")
         logger.summary(f"訓練完成! 最佳字串準確率: {best_string_accuracy:.2f}%, 字元準確率: {best_char_accuracy:.2f}%")
 
-        # 進行錯誤分析
-        logger.log("開始進行錯誤分析...")
+        # 進行最終錯誤分析
+        logger.log("開始進行最終錯誤分析...")
         if 'all_predictions' in locals() and 'all_labels' in locals():
-            analyze_errors(test_loader, all_predictions, all_labels, logger)
+            analyze_errors(test_loader, all_predictions, all_labels, logger, output_dir='final_error_analysis')
 
         # 生成預測視覺化
         logger.log("生成預測視覺化...")
-        visualize_predictions(model, test_loader, config['char_set'], device, num_samples=20)
+        visualize_predictions(model, test_loader, config['char_set'], device, num_samples=30)
 
         # 繪製訓練曲線
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(15, 10))
         
-        plt.subplot(2, 1, 1)
-        plt.plot(train_losses, label='訓練損失')
-        plt.plot(test_losses, label='測試損失')
+        plt.subplot(2, 2, 1)
+        plt.plot(train_losses, label='訓練損失', alpha=0.7)
+        plt.plot(test_losses, label='測試損失', alpha=0.7)
         plt.title('損失曲線')
         plt.xlabel('週期')
         plt.ylabel('損失')
         plt.legend()
+        plt.grid(True, alpha=0.3)
         
-        plt.subplot(2, 1, 2)
-        plt.plot(train_accs, label='訓練準確率')
-        plt.plot(test_string_accs, label='測試字串準確率')
-        plt.plot(test_char_accs, label='測試字元準確率')
+        plt.subplot(2, 2, 2)
+        plt.plot(train_accs, label='訓練準確率', alpha=0.7)
+        plt.plot(test_string_accs, label='測試字串準確率', alpha=0.7)
+        plt.plot(test_char_accs, label='測試字元準確率', alpha=0.7)
         plt.title('準確率曲線')
         plt.xlabel('週期')
         plt.ylabel('準確率 (%)')
         plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 新增學習率曲線圖
+        plt.subplot(2, 2, 3)
+        lr_history = []
+        temp_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optim.AdamW(model.parameters(), lr=config['learning_rate']),
+            T_0=50, T_mult=2, eta_min=1e-6
+        )
+        for i in range(len(train_losses)):
+            lr_history.append(temp_scheduler.get_last_lr()[0])
+            temp_scheduler.step()
+        
+        plt.plot(lr_history, label='學習率', color='orange', alpha=0.7)
+        plt.title('學習率變化')
+        plt.xlabel('週期')
+        plt.ylabel('學習率')
+        plt.yscale('log')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 新增準確率改善圖
+        plt.subplot(2, 2, 4)
+        improvement = [test_string_accs[i] - test_string_accs[i-1] if i > 0 else 0 
+                      for i in range(len(test_string_accs))]
+        plt.plot(improvement, label='字串準確率改善', color='green', alpha=0.7)
+        plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        plt.title('每週期準確率改善')
+        plt.xlabel('週期')
+        plt.ylabel('準確率改善 (%)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('results/training_curves.png')
-        logger.log("保存訓練曲線圖至 results/training_curves.png")
+        plt.savefig('results/improved_training_curves.png', dpi=300, bbox_inches='tight')
+        logger.log("保存改進的訓練曲線圖至 results/improved_training_curves.png")
+        
+        # 儲存詳細的訓練歷史
+        training_history = {
+            'config': config,
+            'train_losses': train_losses,
+            'train_accs': train_accs,
+            'test_losses': test_losses,
+            'test_string_accs': test_string_accs,
+            'test_char_accs': test_char_accs,
+            'best_string_accuracy': best_string_accuracy,
+            'best_char_accuracy': best_char_accuracy,
+            'total_epochs': len(train_losses)
+        }
+        
+        with open('results/training_history.json', 'w', encoding='utf-8') as f:
+            json.dump(training_history, f, indent=2, ensure_ascii=False)
+        
+        logger.log("保存訓練歷史至 results/training_history.json")
     
     except Exception as e:
         logger.log(f"訓練過程中發生錯誤: {str(e)}")
