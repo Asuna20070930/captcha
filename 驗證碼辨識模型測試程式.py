@@ -104,6 +104,179 @@ class CaptchaDataset(Dataset):
         
         return image, label_indices
 
+def get_display_width(text):
+    """計算字串的顯示寬度（考慮中文字元佔2個字元寬度）"""
+    width = 0
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff':  # 中文字元範圍
+            width += 2
+        else:
+            width += 1
+    return width
+
+def align_text(text, width, align='left'):
+    """對齊文字，支援中文字元"""
+    display_width = get_display_width(text)
+    padding = width - display_width
+    if padding <= 0:
+        return text
+    
+    if align == 'left':
+        return text + ' ' * padding
+    elif align == 'right':
+        return ' ' * padding + text
+    else:  # center
+        left_padding = padding // 2
+        right_padding = padding - left_padding
+        return ' ' * left_padding + text + ' ' * right_padding
+
+def generate_test_report(labels, predictions, img_files, char_set, char_accuracy, string_accuracy, output_dir):
+    """生成詳細的測試報告（對齊版本）"""
+    report_path = os.path.join(output_dir, 'test_report.txt')
+    
+    with open(report_path, 'w', encoding='utf-8') as f:
+        # 測試結果
+        f.write("=== 測試結果 ===\n")
+        f.write(f"總樣本數: {len(labels)}\n")
+        f.write(f"字元準確率: {char_accuracy:.2f}%\n")
+        f.write(f"字串準確率: {string_accuracy:.2f}%\n\n")
+        
+        # 預測結果與真實標籤
+        f.write("=== 預測結果與真實標籤 ===\n")
+        
+        # 設定欄位寬度
+        sample_width = 25
+        true_width = 15
+        pred_width = 15
+        correct_width = 12
+        
+        # 輸出表頭
+        header = (align_text("樣本", sample_width) + 
+                 align_text("真實值", true_width) + 
+                 align_text("預測值", pred_width) + 
+                 align_text("是否正確", correct_width))
+        f.write(header + "\n")
+        f.write("=" * (sample_width + true_width + pred_width + correct_width) + "\n")
+        
+        for i, (true_label, pred_label, img_file) in enumerate(zip(labels, predictions, img_files)):
+            is_correct = "正確" if true_label == pred_label else "錯誤"
+            
+            # 對齊每個欄位
+            row = (align_text(img_file, sample_width) + 
+                  align_text(true_label, true_width) + 
+                  align_text(pred_label, pred_width) + 
+                  align_text(is_correct, correct_width))
+            f.write(row + "\n")
+            
+            # 只顯示前50個樣本，避免文件過大
+            if i >= 49:
+                f.write(align_text("...", sample_width + true_width + pred_width + correct_width) + "\n")
+                f.write(align_text(f"(共 {len(labels)} 個樣本)", sample_width + true_width + pred_width + correct_width) + "\n")
+                break
+        
+        # 錯誤分析報告
+        f.write("\n=== 錯誤分析報告 ===\n")
+        total_errors = 0
+        position_errors = defaultdict(int)
+        char_confusion = defaultdict(lambda: defaultdict(int))
+        char_errors = defaultdict(int)
+        
+        # 統計錯誤
+        for true_label, pred_label in zip(labels, predictions):
+            if true_label != pred_label:
+                total_errors += 1
+                # 處理不同長度的標籤
+                max_len = max(len(true_label), len(pred_label))
+                true_padded = true_label.ljust(max_len)
+                pred_padded = pred_label.ljust(max_len)
+                
+                for i, (true_char, pred_char) in enumerate(zip(true_padded, pred_padded)):
+                    if true_char != pred_char:
+                        position_errors[i] += 1
+                        if true_char.strip() and pred_char.strip():  # 避免空字元
+                            char_confusion[true_char][pred_char] += 1
+                            char_errors[true_char] += 1
+        
+        # 總體錯誤率
+        error_rate = 100 * total_errors / len(labels) if len(labels) > 0 else 0
+        f.write(f"總體錯誤率: {error_rate:.2f}% ({total_errors}/{len(labels)})\n\n")
+        
+        # 位置錯誤分析
+        f.write("=== 位置錯誤分析 ===\n")
+        pos_width = 10
+        count_width = 12
+        rate_width = 12
+        
+        # 表頭
+        pos_header = (align_text("位置", pos_width) + 
+                     align_text("錯誤次數", count_width) + 
+                     align_text("錯誤率", rate_width))
+        f.write(pos_header + "\n")
+        f.write("=" * (pos_width + count_width + rate_width) + "\n")
+        
+        # 假設所有標籤長度相同，取最大長度
+        if labels:
+            max_pos = max(len(label) for label in labels)
+            for i in range(max_pos):
+                pos_error_count = position_errors[i]
+                pos_error_rate = 100 * pos_error_count / len(labels) if len(labels) > 0 else 0
+                
+                row = (align_text(str(i+1), pos_width) + 
+                      align_text(str(pos_error_count), count_width) + 
+                      align_text(f"{pos_error_rate:.2f}%", rate_width))
+                f.write(row + "\n")
+        
+        # 各字元錯誤統計
+        f.write("\n=== 各字元錯誤統計 ===\n")
+        char_width = 12
+        error_count_width = 12
+        confused_width = 20
+        
+        # 表頭
+        char_header = (align_text("真實字元", char_width) + 
+                      align_text("錯誤次數", error_count_width) + 
+                      align_text("最常被誤認為", confused_width))
+        f.write(char_header + "\n")
+        f.write("=" * (char_width + error_count_width + confused_width) + "\n")
+        
+        for true_char in sorted(char_errors.keys(), key=lambda x: char_errors[x], reverse=True):
+            error_count = char_errors[true_char]
+            if error_count > 0:
+                # 找出最常被誤認為的字元
+                if char_confusion[true_char]:
+                    most_confused = max(char_confusion[true_char].items(), key=lambda x: x[1])
+                    confused_text = f"{most_confused[0]} ({most_confused[1]}次)"
+                else:
+                    confused_text = "無"
+                
+                row = (align_text(true_char, char_width) + 
+                      align_text(str(error_count), error_count_width) + 
+                      align_text(confused_text, confused_width))
+                f.write(row + "\n")
+        
+        # 詳細的字元混淆矩陣
+        f.write("\n=== 字元混淆矩陣 ===\n")
+        for true_char in sorted(char_confusion.keys()):
+            f.write(f"\n真實字元 '{true_char}' 被誤認為:\n")
+            for pred_char, count in sorted(char_confusion[true_char].items(), key=lambda x: x[1], reverse=True):
+                confusion_text = f"  '{pred_char}': {count} 次"
+                f.write(confusion_text + "\n")
+    
+    # 同時保存為 CSV 格式
+    try:
+        results_df = pd.DataFrame({
+            '樣本': img_files,
+            '真實值': labels,
+            '預測值': predictions,
+            '是否正確': [pred == true for pred, true in zip(predictions, labels)]
+        })
+        results_df.to_csv(os.path.join(output_dir, 'test_results.csv'), index=False, encoding='utf-8-sig')
+        print(f"詳細結果已保存至: {os.path.join(output_dir, 'test_results.csv')}")
+    except Exception as e:
+        print(f"警告: 無法保存CSV文件 - {e}")
+    
+    print(f"測試報告已保存至: {report_path}")
+
 def test_ensemble_model(test_dir, model_path, config_path, output_dir='test_results'):
     """測試集成模型的主函數"""
     
@@ -226,94 +399,6 @@ def test_ensemble_model(test_dir, model_path, config_path, output_dir='test_resu
     
     return char_accuracy, string_accuracy
 
-def generate_test_report(labels, predictions, img_files, char_set, char_accuracy, string_accuracy, output_dir):
-    """生成詳細的測試報告"""
-    report_path = os.path.join(output_dir, 'test_report.txt')
-    
-    with open(report_path, 'w', encoding='utf-8') as f:
-        # 測試結果
-        f.write("=== 測試結果 ===\n")
-        f.write(f"總樣本數: {len(labels)}\n")
-        f.write(f"字元準確率: {char_accuracy:.2f}%\n")
-        f.write(f"字串準確率: {string_accuracy:.2f}%\n\n")
-        
-        # 預測結果與真實標籤
-        f.write("=== 預測結果與真實標籤 ===\n")
-        f.write(f"{'樣本':<20} {'真實值':<10} {'預測值':<10} {'是否正確':<10}\n")
-        f.write("-" * 50 + "\n")
-        
-        for i, (true_label, pred_label, img_file) in enumerate(zip(labels, predictions, img_files)):
-            is_correct = "正確" if true_label == pred_label else "錯誤"
-            f.write(f"{img_file:<20} {true_label:<10} {pred_label:<10} {is_correct:<10}\n")
-            
-            # 只顯示前50個樣本，避免文件過大
-            if i >= 49:
-                f.write("...\n")
-                f.write(f"(共 {len(labels)} 個樣本)\n")
-                break
-        
-        # 錯誤分析報告
-        f.write("\n=== 錯誤分析報告 ===\n")
-        total_errors = 0
-        position_errors = defaultdict(int)
-        char_confusion = defaultdict(lambda: defaultdict(int))
-        char_errors = defaultdict(int)
-        
-        # 統計錯誤
-        for true_label, pred_label in zip(labels, predictions):
-            if true_label != pred_label:
-                total_errors += 1
-                for i, (true_char, pred_char) in enumerate(zip(true_label, pred_label)):
-                    if true_char != pred_char:
-                        position_errors[i] += 1
-                        char_confusion[true_char][pred_char] += 1
-                        char_errors[true_char] += 1
-        
-        # 總體錯誤率
-        error_rate = 100 * total_errors / len(labels)
-        f.write(f"總體錯誤率: {error_rate:.2f}% ({total_errors}/{len(labels)})\n\n")
-        
-        # 位置錯誤分析
-        f.write("=== 位置錯誤分析 ===\n")
-        f.write(f"{'位置':<8} {'錯誤次數':<10} {'錯誤率':<10}\n")
-        f.write("-" * 30 + "\n")
-        
-        for i in range(len(labels[0])):  # 假設所有標籤長度相同
-            pos_error_count = position_errors[i]
-            pos_error_rate = 100 * pos_error_count / len(labels)
-            f.write(f"{i+1:<8} {pos_error_count:<10} {pos_error_rate:.2f}%\n")
-        
-        # 各字元錯誤統計
-        f.write("\n=== 各字元錯誤統計 ===\n")
-        f.write(f"{'真實字元':<10} {'錯誤次數':<10} {'最常被誤認為':<15}\n")
-        f.write("-" * 40 + "\n")
-        
-        for true_char in sorted(char_errors.keys(), key=lambda x: char_errors[x], reverse=True):
-            error_count = char_errors[true_char]
-            if error_count > 0:
-                # 找出最常被誤認為的字元
-                most_confused = max(char_confusion[true_char].items(), key=lambda x: x[1])
-                f.write(f"{true_char:<10} {error_count:<10} {most_confused[0]} ({most_confused[1]}次)\n")
-        
-        # 詳細的字元混淆矩陣
-        f.write("\n=== 字元混淆矩陣 ===\n")
-        for true_char in sorted(char_confusion.keys()):
-            f.write(f"\n真實字元 '{true_char}' 被誤認為:\n")
-            for pred_char, count in sorted(char_confusion[true_char].items(), key=lambda x: x[1], reverse=True):
-                f.write(f"  '{pred_char}': {count} 次\n")
-    
-    # 同時保存為 CSV 格式
-    results_df = pd.DataFrame({
-        '樣本': img_files,
-        '真實值': labels,
-        '預測值': predictions,
-        '是否正確': [pred == true for pred, true in zip(predictions, labels)]
-    })
-    results_df.to_csv(os.path.join(output_dir, 'test_results.csv'), index=False, encoding='utf-8-sig')
-    
-    print(f"測試報告已保存至: {report_path}")
-    print(f"詳細結果已保存至: {os.path.join(output_dir, 'test_results.csv')}")
-
 def visualize_predictions(model, test_loader, char_set, device, output_dir, num_samples=20):
     """視覺化預測結果"""
     vis_dir = os.path.join(output_dir, 'visualization')
@@ -374,7 +459,7 @@ def visualize_predictions(model, test_loader, char_set, device, output_dir, num_
 
 def main():
     # 設定測試參數
-    test_dir = r"C:\Users\C14511\Desktop\captcha\CAPTCHA\00000"  # 測試資料夾路徑
+    test_dir = r"C:\Users\C14511\Desktop\captcha\CAPTCHA\training"  # 測試資料夾路徑
     model_path = r"models\best_ensemble_model.pth"  # 訓練好的模型路徑
     config_path = r"config.json"  # 配置文件路徑
     output_dir = r"test_results"  # 輸出目錄
@@ -387,5 +472,47 @@ def main():
     print(f"字串準確率: {string_accuracy:.2f}%")
     print(f"結果已保存至: {output_dir}")
 
+# 示範對齊效果
+def demo_alignment():
+    """展示對齊效果"""
+    print("=== 對齊效果示範 ===")
+    
+    # 範例資料
+    sample_data = [
+        ("228ab8.png", "228ab8", "228ab8", "正確"),
+        ("22y3g2.png", "22y3g2", "22y8g2", "錯誤"),
+        ("233fy6.png", "233fy6", "233fy6", "正確"),
+        ("23gmrp.png", "23gmrp", "23gmrp", "正確"),
+    ]
+    
+    # 設定欄位寬度
+    sample_width = 25
+    true_width = 15
+    pred_width = 15
+    correct_width = 12
+    
+    print("=== 預測結果與真實標籤 ===")
+    
+    # 輸出表頭
+    header = (align_text("樣本", sample_width) + 
+             align_text("真實值", true_width) + 
+             align_text("預測值", pred_width) + 
+             align_text("是否正確", correct_width))
+    print(header)
+    print("=" * (sample_width + true_width + pred_width + correct_width))
+    
+    # 輸出資料
+    for sample, true_val, pred_val, correct in sample_data:
+        row = (align_text(sample, sample_width) + 
+              align_text(true_val, true_width) + 
+              align_text(pred_val, pred_width) + 
+              align_text(correct, correct_width))
+        print(row)
+
 if __name__ == "__main__":
-    main()
+    # 可以選擇執行主程式或示範對齊效果
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "demo":
+        demo_alignment()
+    else:
+        main()
